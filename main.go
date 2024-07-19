@@ -1,163 +1,153 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
-
-	"github.com/xuri/excelize/v2"
 )
 
-// IPAddress represents a struct to hold the JSON output
-type IPAddress struct {
-	CLIIP string `json:"cli_ip"`
+type IPInfo struct {
+	IP       string `json:"ip"`
+	Country  string `json:"country"`
+	Province string `json:"province"`
+	City     string `json:"city"`
+	ISP      string `json:"isp"`
+	Ret      int    `json:"ret"`
+	Reason   string `json:"reason"`
 }
 
-// IPIPResponse represents the response from the IPIP service
-type IPIPResponse struct {
-	IP        string  `json:"ip"`
-	Country   string  `json:"country"`
-	Province  string  `json:"province"`
-	City      string  `json:"city"`
-	ISP       string  `json:"isp"`
-	Latitude  float64 `json:"latitude"`
-	Longitude float64 `json:"longitude"`
-	Ret       int     `json:"ret"`
-	Reason    string  `json:"reason"`
-}
-
-// Classification represents the classification of IPs
-type Classification struct {
+type ClassifiedIPs struct {
 	Province string   `json:"province"`
 	ISP      string   `json:"isp"`
 	IPs      []string `json:"ips"`
 }
 
-func main() {
-	// 打开并读取 Excel 文件
-	f, err := excelize.OpenFile("data.xlsx")
-	if err != nil {
-		log.Fatalf("Error opening Excel file: %v", err)
-	}
+var (
+	ipv4URL = "http://ipip-service.internal/ipv4?ip="
+	ipv6URL = "http://ipip-service.internal/ipv6?ip="
+	unknown = "unknown"
+)
 
-	// 获取第一个工作表名称
-	sheetName := f.GetSheetName(0)
+func classifyIPs(ips []string) map[string]map[string][]string {
+	result := make(map[string]map[string][]string)
+	var mu sync.Mutex // mutex to handle concurrent map writes
 
-	// 读取所有行
-	rows, err := f.GetRows(sheetName)
-	if err != nil {
-		log.Fatalf("Error getting rows from sheet: %v", err)
-	}
-
-	ipSet := make(map[string]struct{}) // 用于去重
-	var ipList []string
-
-	// 迭代行，从第二行开始
-	for i, row := range rows {
-		if i == 0 {
-			continue // 跳过表头
-		}
-		if len(row) > 1 && row[1] != "" {
-			ip := row[1]
-			if _, exists := ipSet[ip]; !exists {
-				ipSet[ip] = struct{}{}
-				ipList = append(ipList, ip)
-			}
-		}
-	}
-
-	classifications := make(map[string]map[string][]string)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	// Fetch IP details and classify them
-	for _, ip := range ipList {
+	wg := sync.WaitGroup{}
+	for _, ip := range ips {
 		wg.Add(1)
 		go func(ip string) {
 			defer wg.Done()
-
-			// Determine if IP is IPv4 or IPv6
-			var url string
-			if isIPv6(ip) {
-				url = fmt.Sprintf("http://ipip-service.internal/ipv6?ip=%s", ip)
+			var ipInfo IPInfo
+			if strings.Contains(ip, ":") {
+				ipInfo = getIPInfo(ipv6URL + ip)
 			} else {
-				url = fmt.Sprintf("http://ipip-service.internal/ipv4?ip=%s", ip)
+				ipInfo = getIPInfo(ipv4URL + ip)
 			}
 
-			resp, err := http.Get(url)
-			if err != nil {
-				log.Printf("Error getting IP details for %s: %v", ip, err)
-				return
-			}
-			defer resp.Body.Close()
-
-			body, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				log.Printf("Error reading response body for %s: %v", ip, err)
-				return
-			}
-
-			var ipInfo IPIPResponse
-			err = json.Unmarshal(body, &ipInfo)
-			if err != nil {
-				log.Printf("Error unmarshaling JSON response for %s: %v", ip, err)
-				return
-			}
+			province := ipInfo.Province
+			isp := ipInfo.ISP
 
 			if ipInfo.Ret != 1 {
-				log.Printf("Non-successful return for %s: %s", ip, ipInfo.Reason)
-				return
+				province = unknown
+				isp = unknown
 			}
 
 			mu.Lock()
-			if _, exists := classifications[ipInfo.Province]; !exists {
-				classifications[ipInfo.Province] = make(map[string][]string)
+			defer mu.Unlock()
+
+			if _, ok := result[province]; !ok {
+				result[province] = make(map[string][]string)
 			}
-			classifications[ipInfo.Province][ipInfo.ISP] = append(classifications[ipInfo.Province][ipInfo.ISP], ipInfo.IP)
-			mu.Unlock()
+			if _, ok := result[province][isp]; !ok {
+				result[province][isp] = make([]string, 0)
+			}
+
+			result[province][isp] = append(result[province][isp], ip)
 		}(ip)
 	}
-
 	wg.Wait()
-
-	classifiedList := []Classification{}
-
-	for province, isps := range classifications {
-		for isp, ips := range isps {
-			classifiedList = append(classifiedList, Classification{
-				Province: province,
-				ISP:      isp,
-				IPs:      ips,
-			})
-		}
-	}
-
-	outputFile, err := os.Create("classified_ips.json")
-	if err != nil {
-		log.Fatalf("Error creating output file: %v", err)
-	}
-	defer outputFile.Close()
-
-	jsonData, err := json.MarshalIndent(classifiedList, "", "  ")
-	if err != nil {
-		log.Fatalf("Error marshalling classified data to JSON: %v", err)
-	}
-
-	_, err = outputFile.Write(jsonData)
-	if err != nil {
-		log.Fatalf("Error writing JSON to file: %v", err)
-	}
-
-	fmt.Println("Classification complete. Output saved to classified_ips.json")
+	return result
 }
 
-// isIPv6 checks if the given IP address is IPv6
-func isIPv6(ip string) bool {
-	return net.ParseIP(ip) != nil && strings.Contains(ip, ":")
+func getIPInfo(url string) IPInfo {
+	resp, err := http.Get(url)
+	if err != nil {
+		return IPInfo{Ret: 0, Reason: err.Error()}
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return IPInfo{Ret: 0, Reason: err.Error()}
+	}
+
+	var ipInfo IPInfo
+	err = json.Unmarshal(body, &ipInfo)
+	if err != nil {
+		return IPInfo{Ret: 0, Reason: err.Error()}
+	}
+	return ipInfo
+}
+
+func readIPsFromFile(filename string) ([]string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var ips []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		ips = append(ips, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return ips, nil
+}
+
+func main() {
+	file := flag.String("f", "", "input file with IP addresses")
+	flag.Parse()
+
+	var ips []string
+	if *file != "" {
+		fileIPs, err := readIPsFromFile(*file)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
+			os.Exit(1)
+		}
+		ips = fileIPs
+	} else {
+		ips = flag.Args()
+	}
+
+	ips = unique(ips)
+	classified := classifyIPs(ips)
+
+	output, err := json.MarshalIndent(classified, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error generating JSON output: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(output))
+}
+
+func unique(ips []string) []string {
+	keys := make(map[string]bool)
+	var list []string
+	for _, entry := range ips {
+		if _, value := keys[entry]; !value {
+			keys[entry] = true
+			list = append(list, entry)
+		}
+	}
+	return list
 }
